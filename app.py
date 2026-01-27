@@ -6,6 +6,7 @@ QUAVERSE Sistem Sohbeti - Tam Sürüm
 - Tek tuşla mikrofon/kamera aç-kapat
 - SQLite veritabanı: quaverse_chat.db
 - Şifreler plaintext + hash (lokal/test amaçlı)
+- Ana Admin Paneli (kullanıcı yönetimi, co-admin atama, şifre görüntüleme)
 """
 
 import os
@@ -134,6 +135,16 @@ def require_login(fn):
     wrapper.__name__ = fn.__name__
     return wrapper
 
+def require_admin(fn):
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or user['username'] != 'Egmenqua' or user['role'] != 'admin':
+            flash("Bu sayfaya erişim yetkin yok.", "danger")
+            return redirect(url_for('dashboard'))
+        return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
 def chat_room_name(a, b):
     a_, b_ = min(a,b), max(a,b)
     return f"chat_{a_}_{b_}"
@@ -208,6 +219,44 @@ def dashboard():
     conn.close()
     return render_template_string(LAYOUT + DASH_HTML, user=user, friends=friends, others=others, groups=groups)
 
+# ---------------- ADMIN PANEL ----------------
+@app.route('/admin_panel')
+@require_admin
+def admin_panel():
+    user = current_user()
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT id, username, display_name, role, password_plain, password_hash, created_at FROM users ORDER BY created_at ASC")
+    users = c.fetchall()
+    conn.close()
+    return render_template_string(LAYOUT + ADMIN_PANEL_HTML, user=user, users=users)
+
+@app.route('/admin_set_role', methods=['POST'])
+@require_admin
+def admin_set_role():
+    target_id = request.form.get('user_id')
+    new_role = request.form.get('new_role')
+    conn = get_db(); c = conn.cursor()
+
+    # Egmenqua'nın rolü değiştirilemez
+    c.execute("SELECT username FROM users WHERE id=?", (target_id,))
+    row = c.fetchone()
+    if row and row['username'] == 'Egmenqua':
+        flash("Egmenqua'nın rolü değiştirilemez.", "danger")
+        conn.close()
+        return redirect(url_for('admin_panel'))
+
+    if new_role not in ('viewer', 'coadmin', 'admin'):
+        flash("Geçersiz rol.", "danger")
+        conn.close()
+        return redirect(url_for('admin_panel'))
+
+    c.execute("UPDATE users SET role=? WHERE id=?", (new_role, target_id))
+    conn.commit()
+    conn.close()
+    flash("Rol güncellendi.", "success")
+    return redirect(url_for('admin_panel'))
+
+# ---------------- FRIENDS ----------------
 @app.route('/add_friend', methods=['POST'])
 @require_login
 def add_friend():
@@ -229,6 +278,7 @@ def add_friend():
     flash("Arkadaş eklendi.", "success")
     return redirect(url_for('dashboard'))
 
+# ---------------- GROUPS ----------------
 @app.route('/create_group', methods=['POST'])
 @require_login
 def create_group():
@@ -264,6 +314,7 @@ def group_chat(group_id):
     conn.close()
     return render_template_string(LAYOUT + GROUP_CHAT_HTML, user=user, group=group, messages=messages, members=members)
 
+# ---------------- CHAT ----------------
 @app.route('/chat/<int:friend_id>')
 @require_login
 def chat(friend_id):
@@ -288,6 +339,7 @@ def chat(friend_id):
         flash("Önce arkadaş ekle.", "warning"); return redirect(url_for('dashboard'))
     return render_template_string(LAYOUT + CHAT_HTML, user=user, friend=friend, messages=msgs)
 
+# ---------------- PROFILE ----------------
 @app.route('/profile', methods=['GET','POST'])
 @require_login
 def profile():
@@ -405,6 +457,9 @@ video{width:200px;border-radius:12px;background:#000}
       {% if user %}
         <div class="small">Hoşgeldin, <strong>{{ user['display_name'] or user['username'] }}</strong> ({{ user['role'] }})</div>
         <a class="btn" href="{{ url_for('dashboard') }}">Panel</a>
+        {% if user['username']=='Egmenqua' and user['role']=='admin' %}
+          <a class="btn" href="{{ url_for('admin_panel') }}">Ana Admin Paneli</a>
+        {% endif %}
         <a class="btn" href="{{ url_for('profile') }}">Profil</a>
         <a class="btn" href="{{ url_for('logout') }}">Çıkış</a>
       {% else %}
@@ -466,6 +521,9 @@ DASH_HTML = """
     <h3>Kontrol Paneli</h3>
     <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
       <a class="btn" href="{{ url_for('profile') }}">Profil</a>
+      {% if user['username']=='Egmenqua' and user['role']=='admin' %}
+        <a class="btn" href="{{ url_for('admin_panel') }}">Ana Admin Paneli</a>
+      {% endif %}
     </div>
   </div>
 
@@ -519,6 +577,61 @@ DASH_HTML = """
     </div>
   </div>
   <div class="footer">QUAVERSE · 2026</div>
+  </div></body></html>
+"""
+
+ADMIN_PANEL_HTML = """
+  <div class="card">
+    <h2>Ana Admin Paneli</h2>
+    <p class="small">Bu panel yalnızca Egmenqua tarafından görülebilir. (Test amaçlı plaintext şifreler görünür.)</p>
+  </div>
+
+  <div class="card">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Kullanıcı</th>
+          <th>Görünen İsim</th>
+          <th>Rol</th>
+          <th>Şifre (Plain)</th>
+          <th>Şifre (Hash)</th>
+          <th>Oluşturulma</th>
+          <th>Rol Değiştir</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in users %}
+        <tr>
+          <td>{{ u['id'] }}</td>
+          <td>@{{ u['username'] }}</td>
+          <td>{{ u['display_name'] or '-' }}</td>
+          <td><strong>{{ u['role'] }}</strong></td>
+          <td>{{ u['password_plain'] }}</td>
+          <td style="font-size:0.75em;max-width:260px;word-break:break-all">{{ u['password_hash'] }}</td>
+          <td>{{ u['created_at'] }}</td>
+          <td>
+            {% if u['username'] != 'Egmenqua' %}
+            <form method="POST" action="{{ url_for('admin_set_role') }}">
+              <input type="hidden" name="user_id" value="{{ u['id'] }}">
+              <select name="new_role">
+                <option value="viewer" {% if u['role']=='viewer' %}selected{% endif %}>viewer</option>
+                <option value="coadmin" {% if u['role']=='coadmin' %}selected{% endif %}>coadmin</option>
+                <option value="admin" {% if u['role']=='admin' %}selected{% endif %}>admin</option>
+              </select>
+              <button class="btn" type="submit">Uygula</button>
+            </form>
+            {% else %}
+              <span class="small">Değiştirilemez</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">QUAVERSE · Admin Yönetimi</div>
   </div></body></html>
 """
 

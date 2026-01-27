@@ -1,2 +1,5 @@
-flask
-gunicorn
+Flask
+Flask-Session
+Flask-SocketIO
+eventlet
+Werkzeug

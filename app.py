@@ -1,312 +1,540 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash
-from flask_socketio import SocketIO, emit
+from flask import Flask, request, redirect, session, url_for, render_template_string
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3
 import datetime
 
 app = Flask(__name__)
-app.secret_key = "QUAVERSE_CORE_KEY"
-socketio = SocketIO(app)
+app.config['SECRET_KEY'] = 'quaverse-gizli-anahtar'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///quaverse.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-DB = "quaverse_chat.db"
-
-# =========================
-# DATABASE
-# =========================
-def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_plain TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        display_name TEXT,
-        role TEXT DEFAULT 'viewer',
-        is_banned INTEGER DEFAULT 0,
-        is_muted INTEGER DEFAULT 0,
-        created_at TEXT
-    )
-    """)
-    conn.commit()
-
-    # Egmenqua bootstrap
-    c.execute("SELECT * FROM users WHERE username='Egmenqua'")
-    if not c.fetchone():
-        pw = "egmenqua"
-        c.execute("""
-        INSERT INTO users 
-        (username,password_plain,password_hash,display_name,role,created_at)
-        VALUES (?,?,?,?,?,?)
-        """, (
-            "Egmenqua",
-            pw,
-            generate_password_hash(pw),
-            "Egmenqua",
-            "admin",
-            str(datetime.datetime.now())
-        ))
-        conn.commit()
-    conn.close()
-
-init_db()
+db = SQLAlchemy(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # =========================
-# AUTH HELPERS
+# VERİTABANI MODELLERİ
 # =========================
-def current_user():
-    if "uid" not in session:
-        return None
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE id=?", (session["uid"],))
-    u = c.fetchone()
-    conn.close()
-    return u
 
-def require_admin(fn):
-    def wrap(*a, **kw):
-        u = current_user()
-        if not u or u["role"] != "admin":
-            flash("Yetki yok", "danger")
-            return redirect(url_for("chat"))
-        return fn(*a, **kw)
-    wrap.__name__ = fn.__name__
-    return wrap
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    kullanici_adi = db.Column(db.String(80), unique=True, nullable=False)
+    sifre_hash = db.Column(db.String(200), nullable=False)
+    rol = db.Column(db.String(20), default="izleyici")
+
+    # 🔴 EKLENENLER (SADECE EK)
+    is_muted = db.Column(db.Boolean, default=False)
+    is_banned = db.Column(db.Boolean, default=False)
+
+    olusturulma_tarihi = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Mesaj(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    oda = db.Column(db.String(100))
+    kullanici_adi = db.Column(db.String(80))
+    icerik = db.Column(db.Text)
+    zaman = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 # =========================
-# ROUTES
+# YARDIMCI FONKSİYONLAR
 # =========================
-@app.route("/", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
 
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE username=?", (username,))
-        user = c.fetchone()
-        conn.close()
+def aktif_kullanici():
+    if 'user_id' in session:
+        return User.query.get(session['user_id'])
+    return None
 
-        if not user:
-            flash("Kullanıcı yok", "danger")
-            return redirect(url_for("login"))
+# =========================
+# GİRİŞ / KAYIT
+# =========================
 
-        if user["is_banned"]:
-            flash("Bu hesap banlandı.", "danger")
-            return redirect(url_for("login"))
+@app.route('/')
+def anasayfa():
+    if 'user_id' in session:
+        return redirect(url_for('panel'))
+    return render_template_string(ANASAYFA_HTML)
 
-        if not check_password_hash(user["password_hash"], password):
-            flash("Şifre hatalı", "danger")
-            return redirect(url_for("login"))
+@app.route('/kayit', methods=['GET', 'POST'])
+def kayit():
+    if request.method == 'POST':
+        kullanici_adi = request.form['kullanici_adi']
+        sifre = request.form['sifre']
 
-        session["uid"] = user["id"]
-        return redirect(url_for("chat"))
+        if User.query.filter_by(kullanici_adi=kullanici_adi).first():
+            return "Bu kullanıcı adı zaten alınmış."
 
-    return render_template_string(LOGIN_HTML)
+        yeni_kullanici = User(
+            kullanici_adi=kullanici_adi,
+            sifre_hash=generate_password_hash(sifre),
+            rol="izleyici"
+        )
+        db.session.add(yeni_kullanici)
+        db.session.commit()
+        return redirect(url_for('giris'))
 
-@app.route("/logout")
-def logout():
+    return render_template_string(KAYIT_HTML)
+
+@app.route('/giris', methods=['GET', 'POST'])
+def giris():
+    if request.method == 'POST':
+        kullanici_adi = request.form['kullanici_adi']
+        sifre = request.form['sifre']
+
+        kullanici = User.query.filter_by(kullanici_adi=kullanici_adi).first()
+
+        if not kullanici or not check_password_hash(kullanici.sifre_hash, sifre):
+            return "Kullanıcı adı veya şifre hatalı."
+
+        # 🔴 BAN KONTROLÜ (EK)
+        if kullanici.is_banned:
+            return "Bu hesap yönetici tarafından yasaklanmıştır."
+
+        session['user_id'] = kullanici.id
+        return redirect(url_for('panel'))
+
+    return render_template_string(GIRIS_HTML)
+
+@app.route('/cikis')
+def cikis():
     session.clear()
-    return redirect(url_for("login"))
-
-@app.route("/chat")
-def chat():
-    if not current_user():
-        return redirect(url_for("login"))
-    return render_template_string(CHAT_HTML, user=current_user())
+    return redirect(url_for('anasayfa'))
 
 # =========================
-# ADMIN PANEL
-# =========================
-@app.route("/admin")
-@require_admin
-def admin_panel():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users")
-    users = c.fetchall()
-    conn.close()
-    return render_template_string(ADMIN_PANEL_HTML, users=users)
-
-@app.route("/admin_toggle_ban", methods=["POST"])
-@require_admin
-def admin_toggle_ban():
-    uid = request.form["user_id"]
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_banned = 1 - is_banned WHERE id=? AND username!='Egmenqua'", (uid,))
-    conn.commit()
-    conn.close()
-    return redirect(url_for("admin_panel"))
-
-@app.route("/admin_toggle_mute", methods=["POST"])
-@require_admin
-def admin_toggle_mute():
-    uid = request.form["user_id"]
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_muted = 1 - is_muted WHERE id=? AND username!='Egmenqua'", (uid,))
-    conn.commit()
-    conn.close()
-    return redirect(url_for("admin_panel"))
-
-@app.route("/admin_delete_user", methods=["POST"])
-@require_admin
-def admin_delete_user():
-    uid = request.form["user_id"]
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id=? AND username!='Egmenqua'", (uid,))
-    conn.commit()
-    conn.close()
-    return redirect(url_for("admin_panel"))
-
-# =========================
-# SOCKET
-# =========================
-@socketio.on("send_message")
-def handle_message(data):
-    usr = current_user()
-    if not usr:
-        return
-    if usr["is_muted"]:
-        emit("error", {"msg": "Mutelisin"})
-        return
-    emit("receive_message", {
-        "user": usr["display_name"],
-        "msg": data["msg"]
-    }, broadcast=True)
-
-# =========================
-# HTML TEMPLATES
+# KULLANICI PANELİ
 # =========================
 
-LOGIN_HTML = """
+@app.route('/panel')
+def panel():
+    if 'user_id' not in session:
+        return redirect(url_for('giris'))
+    kullanici = aktif_kullanici()
+    return render_template_string(PANEL_HTML, kullanici=kullanici)
+
+# =========================
+# HTML ŞABLONLARI (TÜRKÇE)
+# =========================
+
+ANASAYFA_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>QUAVERSE</title>
-<style>
-body { background:#0b0b14; color:#fff; font-family:Arial; }
-.card { width:300px; margin:100px auto; padding:20px; background:#15152a; }
-input,button { width:100%; margin:5px 0; padding:8px; }
-</style>
+    <title>QUAVERSE</title>
 </head>
 <body>
-<div class="card">
-<h2>QUAVERSE</h2>
-<form method="POST">
-<input name="username" placeholder="Username">
-<input name="password" type="password" placeholder="Password">
-<button>Login</button>
-</form>
-</div>
+    <h1>QUAVERSE'e Hoş Geldin</h1>
+    <a href="/giris">Giriş Yap</a> |
+    <a href="/kayit">Kayıt Ol</a>
 </body>
 </html>
 """
 
-CHAT_HTML = """
+GIRIS_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>QUAVERSE CHAT</title>
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-<style>
-body { background:#0b0b14; color:#fff; font-family:Arial; }
-#chat { height:300px; overflow:auto; border:1px solid #333; padding:5px; }
-</style>
+    <title>Giriş Yap</title>
+</head>
+<body>
+    <h2>Giriş Yap</h2>
+    <form method="post">
+        <input name="kullanici_adi" placeholder="Kullanıcı Adı"><br>
+        <input type="password" name="sifre" placeholder="Şifre"><br>
+        <button>Giriş</button>
+    </form>
+</body>
+</html>
+"""
+
+KAYIT_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kayıt Ol</title>
+</head>
+<body>
+    <h2>Kayıt Ol</h2>
+    <form method="post">
+        <input name="kullanici_adi" placeholder="Kullanıcı Adı"><br>
+        <input type="password" name="sifre" placeholder="Şifre"><br>
+        <button>Kayıt Ol</button>
+    </form>
+</body>
+</html>
+"""
+
+PANEL_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kullanıcı Paneli</title>
+</head>
+<body>
+    <h2>Hoş geldin {{ kullanici.kullanici_adi }}</h2>
+    <p>Rolün: {{ kullanici.rol }}</p>
+
+    <a href="/chat/genel">Genel Sohbet</a><br><br>
+    <a href="/cikis">Çıkış Yap</a>
+</body>
+</html>
+"""
+# =========================
+# SOCKET.IO OLAYLARI
+# =========================
+
+@socketio.on('odaya_katil')
+def odaya_katil(data):
+    oda = data.get('oda')
+    join_room(oda)
+    emit('durum', {
+        'mesaj': f"{data.get('kullanici_adi')} odaya katıldı."
+    }, room=oda)
+
+@socketio.on('odadan_cik')
+def odadan_cik(data):
+    oda = data.get('oda')
+    leave_room(oda)
+    emit('durum', {
+        'mesaj': f"{data.get('kullanici_adi')} odadan çıktı."
+    }, room=oda)
+
+@socketio.on('mesaj_gonder')
+def mesaj_gonder(data):
+    kullanici = aktif_kullanici()
+    if not kullanici:
+        return
+
+    # 🔴 MUTE KONTROLÜ
+    if kullanici.is_muted:
+        emit('hata', {
+            'mesaj': 'Yönetici tarafından susturuldun.'
+        })
+        return
+
+    oda = data.get('oda')
+    icerik = data.get('icerik')
+
+    yeni_mesaj = Mesaj(
+        oda=oda,
+        kullanici_adi=kullanici.kullanici_adi,
+        icerik=icerik
+    )
+    db.session.add(yeni_mesaj)
+    db.session.commit()
+
+    emit('mesaj_al', {
+        'kullanici_adi': kullanici.kullanici_adi,
+        'icerik': icerik,
+        'zaman': yeni_mesaj.zaman.strftime("%H:%M")
+    }, room=oda)
+
+# =========================
+# SOHBET ROUTE
+# =========================
+
+@app.route('/chat/<oda>')
+def sohbet(oda):
+    if 'user_id' not in session:
+        return redirect(url_for('giris'))
+
+    mesajlar = Mesaj.query.filter_by(oda=oda).all()
+    kullanici = aktif_kullanici()
+    return render_template_string(
+        SOHBET_HTML,
+        oda=oda,
+        mesajlar=mesajlar,
+        kullanici=kullanici
+    )
+
+# =========================
+# WEBRTC + STUN (JS)
+# =========================
+
+WEBRTC_JS = """
+<script>
+let yerelAkis;
+let baglanti;
+
+const rtcAyarlar = {
+    iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:global.stun.twilio.com:3478" }
+    ]
+};
+
+async function medyaBaslat() {
+    yerelAkis = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    document.getElementById("yerelVideo").srcObject = yerelAkis;
+}
+
+async function aramaBaslat() {
+    baglanti = new RTCPeerConnection(rtcAyarlar);
+
+    yerelAkis.getTracks().forEach(track => {
+        baglanti.addTrack(track, yerelAkis);
+    });
+
+    baglanti.ontrack = event => {
+        document.getElementById("uzakVideo").srcObject = event.streams[0];
+    };
+}
+
+function aramaBitir() {
+    if (baglanti) {
+        baglanti.close();
+        baglanti = null;
+    }
+}
+</script>
+"""
+
+# =========================
+# SOHBET HTML (TÜRKÇE UI)
+# =========================
+
+SOHBET_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>QUAVERSE Sohbet</title>
+    <style>
+        body {
+            background:#0e0e1a;
+            color:#ffffff;
+            font-family:Arial;
+        }
+        .sohbet-kutu {
+            height:300px;
+            overflow-y:auto;
+            border:1px solid #333;
+            padding:10px;
+        }
+        .kontroller {
+            margin-top:10px;
+        }
+        video {
+            width:200px;
+            border:1px solid #555;
+            margin-right:5px;
+        }
+    </style>
 </head>
 <body>
 
-<h3>Hoşgeldin {{user['display_name']}}</h3>
-<div id="chat"></div>
-<input id="msg"><button onclick="send()">Gönder</button>
+<h2>Oda: {{ oda }}</h2>
 
+<div class="sohbet-kutu" id="sohbetKutu">
+{% for m in mesajlar %}
+    <p><b>{{ m.kullanici_adi }}:</b> {{ m.icerik }}</p>
+{% endfor %}
+</div>
+
+<div class="kontroller">
+    <input id="mesajInput" placeholder="Mesaj yaz...">
+    <button onclick="mesajGonder()">Gönder</button>
+</div>
+
+<hr>
+
+<h3>Görüntülü Görüşme</h3>
+<video id="yerelVideo" autoplay muted></video>
+<video id="uzakVideo" autoplay></video><br><br>
+
+<button onclick="medyaBaslat()">Kamerayı Aç</button>
+<button onclick="aramaBaslat()">Aramayı Başlat</button>
+<button onclick="aramaBitir()">Aramayı Bitir</button>
+
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script>
 const socket = io();
 
-const rtcConfig = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" }
-  ]
-};
+socket.emit('odaya_katil', {
+    oda: "{{ oda }}",
+    kullanici_adi: "{{ kullanici.kullanici_adi }}"
+});
 
-let peer = new RTCPeerConnection(rtcConfig);
-
-function send(){
-  socket.emit("send_message", {msg: msg.value});
-  msg.value="";
+function mesajGonder() {
+    const mesaj = document.getElementById("mesajInput").value;
+    socket.emit('mesaj_gonder', {
+        oda: "{{ oda }}",
+        icerik: mesaj
+    });
+    document.getElementById("mesajInput").value = "";
 }
 
-socket.on("receive_message", d=>{
-  chat.innerHTML += "<div><b>"+d.user+"</b>: "+d.msg+"</div>";
+socket.on('mesaj_al', data => {
+    const kutu = document.getElementById("sohbetKutu");
+    kutu.innerHTML += `<p><b>${data.kullanici_adi}:</b> ${data.icerik}</p>`;
+    kutu.scrollTop = kutu.scrollHeight;
+});
+
+socket.on('hata', data => {
+    alert(data.mesaj);
 });
 </script>
+
+{{ webrtc|safe }}
 
 </body>
 </html>
 """
+# =========================
+# ADMIN YETKİ KONTROLÜ
+# =========================
 
-ADMIN_PANEL_HTML = """
+def admin_mi():
+    kullanici = aktif_kullanici()
+    return kullanici and kullanici.rol == "admin"
+
+# =========================
+# ADMIN PANEL ROUTE
+# =========================
+
+@app.route('/admin')
+def admin_panel():
+    if 'user_id' not in session:
+        return redirect(url_for('giris'))
+
+    if not admin_mi():
+        return "Bu sayfaya erişim yetkin yok."
+
+    kullanicilar = User.query.all()
+    return render_template_string(
+        ADMIN_HTML,
+        kullanicilar=kullanicilar
+    )
+
+# =========================
+# ADMIN AKSİYONLARI
+# =========================
+
+@app.route('/admin/mute/<int:kullanici_id>')
+def admin_mute(kullanici_id):
+    if not admin_mi():
+        return "Yetkisiz işlem."
+
+    u = User.query.get(kullanici_id)
+    u.is_muted = True
+    db.session.commit()
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/unmute/<int:kullanici_id>')
+def admin_unmute(kullanici_id):
+    if not admin_mi():
+        return "Yetkisiz işlem."
+
+    u = User.query.get(kullanici_id)
+    u.is_muted = False
+    db.session.commit()
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/ban/<int:kullanici_id>')
+def admin_ban(kullanici_id):
+    if not admin_mi():
+        return "Yetkisiz işlem."
+
+    u = User.query.get(kullanici_id)
+    u.is_banned = True
+    db.session.commit()
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/unban/<int:kullanici_id>')
+def admin_unban(kullanici_id):
+    if not admin_mi():
+        return "Yetkisiz işlem."
+
+    u = User.query.get(kullanici_id)
+    u.is_banned = False
+    db.session.commit()
+    return redirect(url_for('admin_panel'))
+
+# =========================
+# ADMIN PANEL HTML (TÜRKÇE UI)
+# =========================
+
+ADMIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>ADMIN</title>
-<style>
-body { background:#0b0b14; color:#fff; font-family:Arial; }
-table { width:100%; }
-td,th { padding:5px; border-bottom:1px solid #333; }
-button { padding:5px; }
-</style>
+    <title>QUAVERSE Admin Paneli</title>
+    <style>
+        body {
+            background:#0e0e1a;
+            color:#fff;
+            font-family:Arial;
+        }
+        table {
+            width:100%;
+            border-collapse:collapse;
+        }
+        th, td {
+            border:1px solid #333;
+            padding:8px;
+            text-align:center;
+        }
+        th {
+            background:#1a1a2e;
+        }
+        a {
+            color:#4da6ff;
+            text-decoration:none;
+            margin:0 5px;
+        }
+        .yasakli {
+            color:red;
+        }
+        .susturulmus {
+            color:orange;
+        }
+    </style>
 </head>
 <body>
 
-<h2>ADMIN PANEL</h2>
+<h2>🔐 QUAVERSE Ana Admin Paneli</h2>
+
 <table>
 <tr>
-<th>User</th><th>Role</th><th>Ban</th><th>Mute</th><th>Sil</th>
+    <th>ID</th>
+    <th>Kullanıcı Adı</th>
+    <th>Rol</th>
+    <th>Durum</th>
+    <th>İşlemler</th>
 </tr>
-{% for u in users %}
+
+{% for u in kullanicilar %}
 <tr>
-<td>{{u['username']}}</td>
-<td>{{u['role']}}</td>
-<td>
-<form method="POST" action="/admin_toggle_ban">
-<input type="hidden" name="user_id" value="{{u['id']}}">
-<button>{{'Unban' if u['is_banned'] else 'Ban'}}</button>
-</form>
-</td>
-<td>
-<form method="POST" action="/admin_toggle_mute">
-<input type="hidden" name="user_id" value="{{u['id']}}">
-<button>{{'Unmute' if u['is_muted'] else 'Mute'}}</button>
-</form>
-</td>
-<td>
-<form method="POST" action="/admin_delete_user">
-<input type="hidden" name="user_id" value="{{u['id']}}">
-<button>Sil</button>
-</form>
-</td>
+    <td>{{ u.id }}</td>
+    <td>{{ u.kullanici_adi }}</td>
+    <td>{{ u.rol }}</td>
+    <td>
+        {% if u.is_banned %}
+            <span class="yasakli">Yasaklı</span>
+        {% elif u.is_muted %}
+            <span class="susturulmus">Susturulmuş</span>
+        {% else %}
+            Aktif
+        {% endif %}
+    </td>
+    <td>
+        {% if not u.is_muted %}
+            <a href="/admin/mute/{{ u.id }}">Sustur</a>
+        {% else %}
+            <a href="/admin/unmute/{{ u.id }}">Susturmayı Kaldır</a>
+        {% endif %}
+
+        {% if not u.is_banned %}
+            <a href="/admin/ban/{{ u.id }}">Yasakla</a>
+        {% else %}
+            <a href="/admin/unban/{{ u.id }}">Yasağı Kaldır</a>
+        {% endif %}
+    </td>
 </tr>
 {% endfor %}
 </table>
 
+<br>
+<a href="/panel">⬅ Kullanıcı Paneline Dön</a>
+
 </body>
 </html>
 """
-
-# =========================
-# RUN
-# =========================
-if __name__ == "__main__":
-    socketio.run(app, debug=True)
